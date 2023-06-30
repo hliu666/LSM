@@ -1,0 +1,2 @@
+d_model,n_heads,dim_feedforward,n_layers,lookback_periods,batch_size,time
+4,4,8,2,3,16,195.77565717697144

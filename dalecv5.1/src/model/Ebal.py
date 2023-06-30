@@ -1,0 +1,412 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar 29 11:15:12 2022
+
+@author: Haoran 
+
+Energy Balance Model 
+"""
+import numpy as np
+from resistances import resistances 
+from PhotoSynth import PhotoSynth
+from TIR import rtm_t, calc_netrad
+from TIR import calc_ebal_sunsha, calc_ebal_canopy_pars, calc_netrad_pars
+from TIR import calc_lambda, calc_longwave_irradiance
+from TIR import Planck
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# functions for saturated vapour pressure 
+def es_fun(T):
+    return 6.107*10**(7.5*T/(237.3+T))
+
+def s_fun(es, T):
+    return es*2.3026*7.5*237.3/((237.3+T)**2)
+
+def Monin_Obukhov(ustar, Ta, H):
+    '''Calculates the Monin-Obukhov length.
+
+    Parameters
+    ----------
+    ustar : float
+        friction velocity (m s-1).
+    T_A_K : float
+        air temperature (Kelvin).
+    rho : float
+        air density (kg m-3).
+    c_p : float
+        Heat capacity of air at constant pressure (J kg-1 K-1).
+    H : float
+        sensible heat flux (W m-2).
+    LE : float
+        latent heat flux (W m-2).
+
+    Returns
+    -------
+    L : float
+        Obukhov stability length (m).
+
+    References
+    ----------
+    .. [Brutsaert2005] Brutsaert, W. (2005). Hydrology: an introduction (Vol. 61, No. 8).
+        Cambridge: Cambridge University Press.'''
+
+    cp = 1004
+    rhoa = 1.2047
+    kappa = 0.4
+    g = 9.81
+    L = -rhoa*cp*ustar**3*(Ta+273.15)/(kappa*g*H)
+    return L
+
+def heatfluxes(ra,rs,Tc,ea,Ta,e_to_q,Ca,Ci): 
+    """
+    # this function calculates latent and sensible heat flux
+    #
+    # input:
+    #   ra          aerodynamic resistance for heat         s m-1
+    #   rs          stomatal resistance                     s m-1
+    #   Tc          leaf temperature                        oC
+    #   ea          vapour pressure above canopy            hPa
+    #   Ta          air temperature above canopy            oC
+    #   e_to_q      conv. from vapour pressure to abs hum   hPa-1
+    #   PSI         leaf water potential                    J kg-1
+    #   Ca          ambient CO2 concentration               umol m-3
+    #   Ci          intercellular CO2 concentration         umol m-3
+    #   constants   a structure with physical constants
+    #   es_fun      saturated pressure function es(hPa)=f(T(C))
+    #   s_fun       slope of the saturated pressure function (s(hPa/C) = f(T(C), es(hPa))
+    #
+    # output:
+    #   lEc         latent heat flux of a leaf              W m-2
+    #   Hc          sensible heat flux of a leaf            W m-2
+    #   ec          vapour pressure at the leaf surface     hPa
+    #   Cc          CO2 concentration at the leaf surface   umol m-3
+    """
+    rhoa = 1.2047
+    cp   = 1004
+    
+    #Lambda = (2.501-0.002361*Tc)*1E6    # [J kg-1]  Evapor. heat (J kg-1)
+    Lambda = calc_lambda(Tc+273.15)   # [J kg-1]  Evapor. heat (J kg-1)
+    ei = es_fun(Tc)
+    s  = s_fun(ei, Tc)
+
+    qi = ei * e_to_q
+    qa = ea * e_to_q
+    
+    lE = rhoa/(ra+rs)*Lambda*(qi-qa)    # [W m-2]   Latent heat flux
+    H  = (rhoa*cp)/ra*(Tc-Ta)           # [W m-2]   Sensible heat flux
+    ec = ea + (ei-ea)*ra/(ra+rs)        # [W m-2] vapour pressure at the leaf surface
+    Cc = Ca - (Ca-Ci)*ra/(ra+rs)        # [umol m-2 s-1] CO2 concentration at the leaf surface
+    
+    return [lE, H, ec, Cc, Lambda, s]
+
+def Ebal(dC, x, lai, ebal_rtm_pars, k_pars):    
+    
+    """
+    # 1. initialisations and other preparations for the iteration loop
+    # parameters for the closure loop
+    """
+    counter     = 0                # iteration counter of ebal
+    maxit       = 50               # maximum number of iterations
+    maxEBer     = 0.1              # maximum energy balance error (any leaf) [Wm-2]
+    Wc          = 1                # update step (1 is nominal, [0,1] possible)
+    CONT        = 1               # boolean indicating whether iteration continues
+    
+    # constants
+    MH2O        = 18          # [g mol-1]     Molecular mass of water
+    Mair        = 28.96       # [g mol-1]     Molecular mass of dry air
+    rhoa        = 1.2047      # [kg m-3]      Specific mass of air
+    cp          = 1004        # [J kg-1 K-1]  Specific heat of dry air
+    sigmaSB     = 5.67E-8     # [W m-2 K-4]   Stefan Boltzman constant  
+    
+    # input preparation
+    rss         = 500.0       # soil resistance for evaporation from the pore space
+    
+    # meteo
+    Ta          = dC.t_mean[x]
+    ea          = dC.ea
+    #ea         = 4.6491*np.exp(0.062*ta)# atmospheric vapour pressure
+    Ca          = dC.ca                   # atmospheric CO2 concentration
+    p           = dC.p                    # air pressure
+    o           = dC.o                    # atmospheric O2 concentration
+    ech         = ea                      # Leaf boundary vapour pressure (shaded/sunlit leaves)
+    Cch         = Ca
+    ecu         = ea 
+    Ccu         = Ca                      # Leaf boundary CO2 (shaded/sunlit leaves)   
+    
+    # other preparations
+    e_to_q      = MH2O/Mair/p             # Conversion of vapour pressure [Pa] to absolute humidity [kg kg-1]
+
+    # initial values for the loop
+    Tsu         = (Ta + 3.0)                 # soil temperature (+3 for a head start of the iteration) 
+    Tsh         = (Ta + 3.0)                 # soil temperature (+3 for a head start of the iteration) 
+    Tcu         = (Ta + 0.3)                 # leaf tempeFrature (sunlit leaves)
+    Tch         = (Ta + 0.1)                 # leaf temperature (shaded leaves)    
+    l_mo        = -1E6                       # Monin-Obukhov length
+
+    T_Pars = [Ta, Tcu, Tch, Tsu, Tsh]    
+    
+    L  = calc_longwave_irradiance(ea, Ta+273.15)
+    SW = dC.sw[x]
+    """
+    ## 2.1 Energy balance iteration loop
+    #Energy balance loop (Energy balance and radiative transfer)
+    """
+    wl = dC.wl
+    Ls = Planck(wl, Ta+273.15)
+    ebal_sunsha_pars  = calc_ebal_sunsha(dC, x, lai)
+    ebal_canopy_pars  = calc_ebal_canopy_pars(dC, x, Ls, ebal_rtm_pars)    
+    net_rads, Esolars = calc_netrad_pars(dC, x, lai, SW, L, ebal_sunsha_pars, ebal_canopy_pars)
+
+    while CONT:                          # while energy balance does not close
+        rad_Rnuc, rad_Rnhc, APARu, APARh, rad_Rnus, rad_Rnhs, Fc, Fs, i0, iD = calc_netrad(dC, x, lai, L, T_Pars, net_rads, ebal_rtm_pars, ebal_sunsha_pars)
+        if (dC.tts[x] < 75) and (lai > 0.5): 
+            APARu = max(APARu, 1e-16) 
+            APARh = max(APARh, 1e-16)  
+
+            meteo_u = [APARu, Ccu, Tcu, ecu, o, p]
+            meteo_h = [APARh, Cch, Tch, ech, o, p]
+            
+            # Fluxes (latent heat flux (lE), sensible heat flux (H) and soil heat flux G
+            # in analogy to Ohm's law, for canopy (c) and soil (s). All in units of [W m-2]
+            bcu_rcw, bcu_Ci, _ = PhotoSynth(meteo_u, [dC.Vcmax25, dC.BallBerrySlope])
+            bch_rcw, bch_Ci, _ = PhotoSynth(meteo_h, [dC.Vcmax25, dC.BallBerrySlope])
+        else:
+            bcu_rcw, bcu_Ci, _ = 4160, Ca, 0.0
+            bch_rcw, bch_Ci, _ = 4160, Ca, 0.0
+            
+        # Aerodynamic roughness
+        # calculate friction velocity [m s-1] and aerodynamic resistances [s m-1]  
+        raa, rawc, raws, ustar = resistances(lai, l_mo, dC.wds[x])
+        rac     = (lai+1)*(raa+rawc)
+        ras     = (lai+1)*(raa+raws)
+
+        [lEcu,Hcu,ecu,Ccu,lambdau,su]     = heatfluxes(rac,bcu_rcw,Tcu,ea,Ta,e_to_q,Ca,bcu_Ci)
+        [lEch,Hch,ech,Cch,lambdah,sh]     = heatfluxes(rac,bch_rcw,Tch,ea,Ta,e_to_q,Ca,bch_Ci)
+        [lEsu,Hsu,_,_,lambdasu,ssu]       = heatfluxes(ras,rss,    Tsu,ea,Ta,e_to_q,Ca,Ca)
+        [lEsh,Hsh,_,_,lambdash,ssh]       = heatfluxes(ras,rss,    Tsh,ea,Ta,e_to_q,Ca,Ca)
+        
+        # integration over the layers and sunlit and shaded fractions
+        Hctot   = Fc*Hcu + (1-Fc)*Hch
+        Hstot   = Fs*Hsu + (1-Fs)*Hsh
+        Htot    = Hstot + Hctot*lai
+
+        lEctot   = Fc*lEcu + (1-Fc)*lEch
+        lEstot   = Fs*lEsu + (1-Fs)*lEsh
+        lEtot    = lEstot + lEctot*lai
+
+        l_mo = Monin_Obukhov(ustar, Ta, Htot)
+        # ground heat flux
+        soil_rs_thermal = 0.06 #broadband soil reflectance in the thermal range 1 - emissivity
+        
+        Gu  = 0.35*rad_Rnus
+        Gh  = 0.35*rad_Rnhs
+        
+        dGu = 4*(1-soil_rs_thermal)*sigmaSB*(Tsu+273.15)**3*0.35
+        dGh = 4*(1-soil_rs_thermal)*sigmaSB*(Tsh+273.15)**3*0.35
+
+        # energy balance errors, continue criterion and iteration counter
+        #EBercu  = rad_Rnuc/(lai*Fc)     -lEcu -Hcu
+        #EBerch  = rad_Rnhc/(lai*(1-Fc)) -lEch -Hch
+        EBercu  = rad_Rnuc/(lai*Fc)     -lEcu -Hcu
+        EBerch  = rad_Rnhc/(lai*(1-Fc)) -lEch -Hch
+        EBersu  = rad_Rnus -lEsu -Hsu - Gu
+        EBersh  = rad_Rnhs -lEsh -Hsh - Gh
+   
+        counter     = counter + 1                   #Number of iterations
+
+        maxEBercu   = abs(EBercu)
+        maxEBerch   = abs(EBerch)
+        maxEBers    = max(abs(EBersu), abs(EBersh))
+
+        CONT        = (((maxEBercu >   maxEBer)   or
+                        (maxEBerch >   maxEBer)   or
+                        (maxEBers  >   maxEBer))  and
+                        (counter   <   maxit+1))
+        if counter==10:
+            Wc = 0.8
+        if counter==20:
+            Wc = 0.6
+            
+        #l.append([rad_Rnuc, rad_Rnhc, ERnuc, ERnhc, ELnuc, ELnhc, lEcu, lEch, Hcu, Hch, Tcu, Tch])
+        # if counter>99, plot(EBercu(:)), hold on, end
+        # 2.7. New estimates of soil (s) and leaf (c) temperatures, shaded (h) and sunlit (1)
+        leafbio_emis = 0.98
+        Tcu         = Tcu + Wc*EBercu/((rhoa*cp)/rac + rhoa*lambdau *e_to_q*su/(rac+bcu_rcw)+ 4*leafbio_emis       *sigmaSB*(Tcu+273.15)**3)        
+        Tch         = Tch + Wc*EBerch/((rhoa*cp)/rac + rhoa*lambdah *e_to_q*sh/(rac+bch_rcw)+ 4*leafbio_emis       *sigmaSB*(Tch+273.15)**3)
+        Tsu         = Tsu + Wc*EBersu/((rhoa*cp)/ras + rhoa*lambdasu*e_to_q*ssu/(ras+rss)   + 4*(1-soil_rs_thermal)*sigmaSB*(Tsu+273.15)**3 + dGu)        
+        Tsh         = Tsh + Wc*EBersh/((rhoa*cp)/ras + rhoa*lambdash*e_to_q*ssh/(ras+rss)   + 4*(1-soil_rs_thermal)*sigmaSB*(Tsh+273.15)**3 + dGh)
+        
+    if abs(Tcu-Ta) > 10 or np.isnan(Tcu):
+        if x > 0:
+            Tcu = Ta + (dC.t_mean[x]-dC.t_mean[x-1])  
+        else:
+            Tcu = Ta + 0.3
+    if abs(Tch-Ta) > 10 or np.isnan(Tch):
+        if x > 0:
+            Tch = Ta + (dC.t_mean[x]-dC.t_mean[x-1])  
+        else:
+            Tch = Ta + 0.1
+    if abs(Tsu-Ta) > 10 or np.isnan(Tsu):
+        if x > 0:
+            Tsu = Ta + (dC.t_mean[x]-dC.t_mean[x-1])  
+        else:
+            Tsu = Ta + 3.0
+    if abs(Tsh-Ta) > 10 or np.isnan(Tsh):
+        if x > 0:
+            Tsh = Ta + (dC.t_mean[x]-dC.t_mean[x-1])  
+        else:
+            Tsh = Ta + 3.0
+            
+    T_Pars = [round(Ta,2), round(Tcu,2), round(Tch,2), round(Tsu,2), round(Tsh,2)] 
+
+    LST = rtm_t(lai, L, i0, iD, wl, Tcu,Tch,Tsu,Tsh, dC, x, k_pars)
+    #print(round(Ta,2), round(LST,2), round(Tcu,2), round(Tch,2), round(Tsu,2), round(Tsh,2) )
+    #import numpy as np
+    #if np.isnan(LST):
+    #   print("Check!!! soil temp")
+
+    #return Cc, T, ec, Esolars, LST, Fc
+    return Ccu, Cch, Tcu, Tch, ecu, ech, APARu, APARh, Esolars, LST, Fc
+
+def Ebal_single(dC, x, lai, ebal_rtm_pars, k_pars):
+    """
+    # 1. initialisations and other preparations for the iteration loop
+    # parameters for the closure loop
+    """
+    counter     = 0                # iteration counter of ebal
+    maxit       = 50               # maximum number of iterations
+    maxEBer     = 0.1              # maximum energy balance error (any leaf) [Wm-2]
+    Wc          = 1                # update step (1 is nominal, [0,1] possible)
+    CONT        = 50               # boolean indicating whether iteration continues
+    
+    # constants
+    MH2O        = 18          # [g mol-1]     Molecular mass of water
+    Mair        = 28.96       # [g mol-1]     Molecular mass of dry air
+    rhoa        = 1.2047      # [kg m-3]      Specific mass of air
+    cp          = 1004        # [J kg-1 K-1]  Specific heat of dry air
+    sigmaSB     = 5.67E-8     # [W m-2 K-4]   Stefan Boltzman constant  
+    
+    # input preparation
+    rss         = 500.0       # soil resistance for evaporation from the pore space
+    
+    # meteo
+    Ta          = dC.t_mean[x]
+    ea          = dC.ea
+    #ea         = 4.6491*np.exp(0.062*ta)# atmospheric vapour pressure
+    Ca          = dC.ca                   # atmospheric CO2 concentration
+    p           = dC.p                    # air pressure
+    o           = dC.o                    # atmospheric O2 concentration
+    ech         = ea                      # Leaf boundary vapour pressure (shaded/sunlit leaves)
+    Cch         = Ca
+    ecu         = ea 
+    Ccu         = Ca                      # Leaf boundary CO2 (shaded/sunlit leaves)   
+      
+    # other preparations
+    e_to_q      = MH2O/Mair/p             # Conversion of vapour pressure [Pa] to absolute humidity [kg kg-1]
+
+    # initial values for the loop
+    Tsu         = (Ta + 3.0)                 # soil temperature (+3 for a head start of the iteration) 
+    Tsh         = (Ta + 3.0)                 # soil temperature (+3 for a head start of the iteration) 
+    Tcu         = (Ta + 0.3)                 # leaf tempeFrature (sunlit leaves)
+    Tch         = (Ta + 0.1)                 # leaf temperature (shaded leaves)    
+    l_mo        = -1E6                       # Monin-Obukhov length
+
+    T_Pars = [Ta, Tcu, Tch, Tsu, Tsh]    
+    
+    L = calc_longwave_irradiance(ea, Ta+273.15)
+    SW = dC.sw[x]
+    """
+    ## 2.1 Energy balance iteration loop
+    #Energy balance loop (Energy balance and radiative transfer)
+    """
+    wl = dC.wl
+    Ls = Planck(wl, Ta+273.15)
+    ebal_sunsha_pars  = calc_ebal_sunsha(dC, x, lai)
+    ebal_canopy_pars  = calc_ebal_canopy_pars(dC, x, lai, Ls, ebal_rtm_pars)    
+    net_rads, Esolars = calc_netrad_pars(dC, x, lai, SW, L, ebal_sunsha_pars, ebal_canopy_pars)
+    
+    rad_Rnuc, rad_Rnhc, APARu, APARh, rad_Rnus, rad_Rnhs, Fc, Fs, i0, iD = calc_netrad(dC, x, lai, L, T_Pars, net_rads, ebal_rtm_pars, ebal_sunsha_pars)
+    if (dC.tts[x] < 75) and (lai > 0.5): 
+        APARu = max(APARu, 0.0) 
+        APARh = max(APARh, 0.0) 
+
+        meteo_u = [APARu/lai, Ccu, Tcu, ecu, o, p]
+        meteo_h = [APARh/lai, Cch, Tch, ech, o, p]
+        
+        # Fluxes (latent heat flux (lE), sensible heat flux (H) and soil heat flux G
+        # in analogy to Ohm's law, for canopy (c) and soil (s). All in units of [W m-2]
+        bcu_rcw, bcu_Ci, bcu_An = PhotoSynth(meteo_u, [dC.Vcmax25, dC.BallBerrySlope])
+        bch_rcw, bch_Ci, bch_An = PhotoSynth(meteo_h, [dC.Vcmax25, dC.BallBerrySlope])
+    else:
+        bcu_rcw, bcu_Ci, bcu_An = 4160, Ccu, 0.0
+        bch_rcw, bch_Ci, bch_An = 4160, Cch, 0.0
+ 
+    # Aerodynamic roughness
+    # calculate friction velocity [m s-1] and aerodynamic resistances [s m-1]  
+    raa, rawc, raws, ustar = resistances(lai, l_mo, dC.wds[x])
+    rac     = (lai+1)*(raa+rawc)
+    ras     = (lai+1)*(raa+raws)
+
+    [lEcu,Hcu,ecu,Ccu,lambdau,su]     = heatfluxes(rac,bcu_rcw,Tcu,ea,Ta,e_to_q,Ca,bcu_Ci)
+    [lEch,Hch,ech,Cch,lambdah,sh]     = heatfluxes(rac,bch_rcw,Tch,ea,Ta,e_to_q,Ca,bch_Ci)
+    [lEsu,Hsu,_,_,lambdasu,ssu]       = heatfluxes(ras,rss,    Tsu,ea,Ta,e_to_q,Ca,Ca)
+    [lEsh,Hsh,_,_,lambdash,ssh]       = heatfluxes(ras,rss,    Tsh,ea,Ta,e_to_q,Ca,Ca)
+    
+    # integration over the layers and sunlit and shaded fractions
+    Hstot   = Fs*Hsu + (1-Fs)*Hsh
+    Hctot   = Fc*Hcu + (1-Fc)*Hch
+    Htot    = Hstot + Hctot*lai
+
+    lEstot   = Fs*lEsu + (1-Fs)*lEsh
+    lEctot   = Fc*lEcu + (1-Fc)*lEch
+    lEtot    = lEstot + lEctot*lai
+        
+    #rho = 1.2047
+    #T_A_K = (Ta + 273.15)
+    #H  = Htot
+    #LE = lEtot
+    #c_p = calc_c_p(1013.25, ea)
+    #l_mo = Monin_Obukhov(ustar, T_A_K, rho, c_p, H, LE)
+
+    l_mo = Monin_Obukhov(ustar, Ta, Htot)
+    # ground heat flux
+    soil_rs_thermal = 0.06 #broadband soil reflectance in the thermal range 1 - emissivity
+    
+    Gu  = 0.35*rad_Rnus
+    Gh  = 0.35*rad_Rnhs
+    
+    dGu = 4*(1-soil_rs_thermal)*sigmaSB*(Tsu+273.15)**3*0.35
+    dGh = 4*(1-soil_rs_thermal)*sigmaSB*(Tsh+273.15)**3*0.35
+      
+    # energy balance errors, continue criterion and iteration counter
+    EBercu  = rad_Rnuc/(lai*Fc)      -lEcu -Hcu
+    EBerch  = rad_Rnhc/(lai*(1-Fc))  -lEch -Hch
+    EBersu  = rad_Rnus -lEsu -Hsu - Gu
+    EBersh  = rad_Rnhs -lEsh -Hsh - Gh
+      
+    #l.append([rad_Rnuc, rad_Rnhc, ERnuc, ERnhc, ELnuc, ELnhc, lEcu, lEch, Hcu, Hch, Tcu, Tch])
+    # if counter>99, plot(EBercu(:)), hold on, end
+    # 2.7. New estimates of soil (s) and leaf (c) temperatures, shaded (h) and sunlit (1)
+    leafbio_emis = 0.98
+    Tch         = Tch + Wc*EBerch/((rhoa*cp)/rac + rhoa*lambdah *e_to_q*sh/(rac+bch_rcw)+ 4*leafbio_emis       *sigmaSB*(Tch+273.15)**3)
+    Tcu         = Tcu + Wc*EBercu/((rhoa*cp)/rac + rhoa*lambdau *e_to_q*su/(rac+bcu_rcw)+ 4*leafbio_emis       *sigmaSB*(Tcu+273.15)**3)
+    Tsh         = Tsh + Wc*EBersh/((rhoa*cp)/ras + rhoa*lambdash*e_to_q*ssh/(ras+rss)   + 4*(1-soil_rs_thermal)*sigmaSB*(Tsh+273.15)**3 + dGh)
+    Tsu         = Tsu + Wc*EBersu/((rhoa*cp)/ras + rhoa*lambdasu*e_to_q*ssu/(ras+rss)   + 4*(1-soil_rs_thermal)*sigmaSB*(Tsu+273.15)**3 + dGu)
+
+    if abs(Tcu-Ta) > 10:
+        Tcu = Ta + 0.3
+    if abs(Tch-Ta) > 10:
+        Tch = Ta + 0.1
+    if abs(Tsu-Ta) > 10:
+        Tsu = Ta + 3.0
+    if abs(Tsh-Ta) > 10:
+        Tsh = Ta + 3.0
+    
+    T_Pars = [round(Ta,2), round(Tcu,2), round(Tch,2), round(Tsu,2), round(Tsh,2)] 
+    
+    LST, emis = rtm_t(lai, L, i0, iD, wl, Tcu,Tch,Tsu,Tsh, dC, x, k_pars)
+
+    #return Cc, T, ec, Esolars, LST, Fc
+    return Ccu, Cch, Tcu, Tch, ecu, ech, APARu, APARh, Esolars, LST, emis, Fc

@@ -1,0 +1,119 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Jan  1 21:37:01 2023
+
+@author: hliu
+"""
+import scipy.stats as stats
+import joblib
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+
+def func(x, a, b, c, d):
+    return a * np.log(b * x + c) - d
+
+"""
+Read photosynthesis, and stomata conductance 
+"""
+an  = joblib.load("../../../data/output/model/An_ci1_HARV.pkl")
+re  = joblib.load("../../../data/output/model/Re_ci1_HARV.pkl")
+gs  = 1/re
+
+"""
+Read air temperature and land surface temperature 
+"""
+lst = joblib.load("../../../data/output/model/lst_ci1_HARV.pkl")
+flux_data = pd.read_csv("../../../data/driving/HARV.csv", na_values="nan") 
+ata = np.array(flux_data['TA'])[0:26280]
+
+"""
+Read label variables 
+"""
+apar = joblib.load("../../../data/output/model/apar_ci1_HARV.pkl")
+par  = joblib.load("../../../data/output/model/par_ci1_HARV.pkl")
+vpd  = np.array(flux_data['VPD'])[0:26280]
+
+output  = joblib.load( "../../../data/output/model/out_ci1_HARV.pkl")
+lai = np.repeat(output[:,-1], 24)[0:26280]
+
+date = np.array(flux_data[['hour', 'doy', 'month']])[0:26280]
+
+det = lst-ata
+
+y_lists, x_lists = [an, gs], det
+y_labels = ["Photosynthesis ({0}mol CO₂m\u207B\u00B2s\u207B\u00B9)".format(chr(956)), 'Stomata Conductance (mmol m\u207B\u00B2s\u207B\u00B9)']
+x_labels = ['APAR ({0}mol CO₂m\u207B\u00B2s\u207B\u00B9)'.format(chr(956)),]
+
+
+fig, ax = plt.subplots(1, 2, figsize=(18,8))
+
+for i in range(len(y_lists)):
+    x, y, z = apar, y_lists[i], det
+    arr = np.hstack((x.reshape(-1,1), y.reshape(-1,1), z.reshape(-1,1)))
+    arr = np.hstack((arr, date))
+    
+    #arr = arr[(arr[:,2] >= 0) & (arr[:,2] <= 1000)]
+
+    arr = arr[arr[:,1] > 0]
+    arr = arr[arr[:,1].argsort()] 
+    #2: hour, 3: doy, 4:month
+    xobs, yobs, cobs = arr[:,0], arr[:,1], arr[:,2]
+  
+    #popt, pcov = curve_fit(func, xobs, yobs)
+    #yfits = func(xobs, *popt)
+    
+    r, p = stats.pearsonr(xobs, yobs) 
+    
+    nx = 3 #y轴刻度个数
+    ny = 3 #y轴刻度个数
+    
+    linewidth = 1.8 #边框线宽度
+    ftsize = 28 #字体大小
+    axlength = 6.0 #轴刻度长度
+    axwidth = 2.0 #轴刻度宽度
+    legendcols = 5 #图例一行的个数
+    ftfamily = 'Calibri'
+    
+    #ax[i,j].scatter(xobs, yobs, marker='o', color='None', s=40, edgecolors="black", label='Observations')                
+    #p1 = ax[i,j].scatter(xobs, yobs, c=cobs, marker='o', s=40, cmap=plt.cm.coolwarm) 
+    """
+    if i == 1:
+        p1 = ax[i,j].hexbin(xobs, yobs*1000, C=cobs, cmap=plt.cm.coolwarm, gridsize=25, mincnt=3, reduce_C_function=np.mean)
+    else:
+        p1 = ax[i,j].hexbin(xobs, yobs, C=cobs, cmap=plt.cm.coolwarm, gridsize=25, mincnt=3, reduce_C_function=np.mean)
+    """
+    if i == 1:
+        p1 = ax[i].scatter(xobs, yobs*1000, c=cobs, marker='o', s=15, cmap=plt.cm.jet, alpha=0.8)
+    else:
+        p1 = ax[i].scatter(xobs, yobs, c=cobs, marker='o', s=15, cmap=plt.cm.jet, alpha=0.8)
+    
+    #p1.set_facecolor("none")
+    #cb = fig.colorbar(p1, ax=ax[i,j])
+    #cb.ax.yaxis.set_tick_params(labelsize=ftsize)
+    
+    #axs.set_xlabel("Photosynthesis ({0}mol CO₂m\u207B\u00B2s\u207B\u00B9)".format(chr(956)), fontsize = ftsize*1.2, family = ftfamily, labelpad=5)
+    #axs.set_ylabel("Temperature differences (canopy-air)", fontsize = ftsize*1.2, family = ftfamily, labelpad=5)
+
+    ax[i].set_xlabel(x_labels[0], fontsize = ftsize*1.2, family = ftfamily, labelpad=5)
+    ax[i].set_ylabel(y_labels[i], fontsize = ftsize*1.2, family = ftfamily, labelpad=5)
+     
+    ax[i].spines['left'].set_linewidth(linewidth)
+    ax[i].spines['right'].set_linewidth(linewidth)
+    ax[i].spines['top'].set_linewidth(linewidth)
+    ax[i].spines['bottom'].set_linewidth(linewidth)
+    ax[i].tick_params(direction = 'in', axis='both', length = axlength, width = axwidth, labelsize = ftsize, color="black")        
+    #print(x_labels[i], y_labels[j], round(r*r, 2))
+    #axs.text(0, 5, "R\u00B2={0}, p<0.01".format(round(r*r, 2)), fontsize=ftsize*1.2) 
+   
+cax = fig.add_axes([1.02, 0.25, 0.015, 0.5])
+cbar = fig.colorbar(p1, cax=cax)
+#cbar = fig.colorbar(p1, cax=cax, ticks=[min(z)+10, (min(z)+max(z)-100)/2, max(z)-100])   
+#cbar.ax.set_yticklabels(['0', '1000', '2000'])  # vertically oriented colorbar
+cbar.ax.tick_params(right= False, labelsize=ftsize)
+cbar.ax.set_title('ΔT', fontsize=ftsize)
+                   
+fig.tight_layout()          
+plot_path = "../../../figs/lst_ta/plot_apar.jpg"
+fig.savefig(plot_path, dpi=600, bbox_inches = 'tight')    
